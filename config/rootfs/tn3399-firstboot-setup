@@ -1,0 +1,244 @@
+#!/bin/bash
+# TN3399_V3 首次成功启动后的一次性初始化。
+# 只在真正完成全部 4 项后写入状态标记；中途退出/失败会在下次启动时重试。
+set -euo pipefail
+shopt -s execfail
+
+STATE=/var/lib/tn3399-firstboot-setup.done
+LOG=/var/log/tn3399-firstboot-setup.log
+TTY=/dev/ttyS2
+BAUD=1500000
+GETTY=serial-getty@ttyS2.service
+MIRROR_RECORD=/etc/tn3399-mirror.choice
+KERNEL_LOCK=/etc/tn3399-kernel-lock
+
+mkdir -p "$(dirname "$STATE")" "$(dirname "$LOG")"
+exec >>"$LOG" 2>&1
+printf '\n===== firstboot setup %s =====\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [[ -f "$STATE" ]]; then
+    printf '已完成初始化（标记存在），跳过。\n'
+    exit 0
+fi
+
+# 接管串口控制台：先停 getty，结束时无论成功/失败都恢复登录提示。
+HAVE_TTY=0
+if [[ -c "$TTY" ]]; then
+    systemctl stop "$GETTY" >/dev/null 2>&1 || true
+    if exec 3<>"$TTY"; then
+        HAVE_TTY=1
+        stty -F "$TTY" "$BAUD" sane 2>/dev/null || true
+    fi
+fi
+if [[ "$HAVE_TTY" -eq 0 ]]; then
+    exec 3<>/dev/console
+fi
+restore_console() {
+    printf '\n恢复串口登录: %s\n' "$GETTY"
+    systemctl start "$GETTY" >/dev/null 2>&1 || true
+}
+trap restore_console EXIT
+
+out() {
+    printf '%s\n' "$*"
+    printf '%s\n' "$*" >&3
+}
+ask() {
+    printf '%s' "$1" >&3
+    printf 'PROMPT %s' "$1"
+    local reply=""
+    IFS= read -r reply <&3 || reply=""
+    printf 'INPUT  %s\n' "$reply"
+    printf '%s' "$reply"
+}
+
+out '===== TN3399_V3 首次启动初始化（本脚本只运行一次）====='
+
+# ---- 1. root 密码 + 普通用户 + sudo ----
+out '[1/4] 设置 root 密码（强制，输入不回显）'
+until passwd root <&3 >&3 2>&3; do
+    out 'root 密码设置失败，请重试。'
+done
+out 'root 密码已更新。'
+
+while true; do
+    username="$(ask '请输入要创建的普通用户名（小写字母/下划线开头，必填）: ')"
+    if [[ -z "$username" ]]; then
+        out '用户名不能为空。'
+        continue
+    fi
+    if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+        out '用户名不合法：小写字母/下划线开头，仅允许小写字母、数字、下划线、连字符，最长 32 位。'
+        continue
+    fi
+    if id "$username" >/dev/null 2>&1; then
+        out "用户 ${username} 已存在，将重置其密码。"
+    else
+        if ! useradd -m -s /bin/bash "$username"; then
+            out '创建用户失败，请换一个用户名。'
+            continue
+        fi
+    fi
+    out "请为用户 ${username} 设置密码（输入不回显）"
+    if passwd "$username" <&3 >&3 2>&3; then
+        break
+    fi
+    out '密码设置失败，请重试。'
+done
+for grp in sudo adm cdrom dip plugdev; do
+    if getent group "$grp" >/dev/null 2>&1; then
+        usermod -aG "$grp" "$username"
+    fi
+done
+out "用户 ${username} 已加入 sudo 组。"
+
+# ---- 2. APT 镜像源（Armbian + Debian 主源 + Debian 安全更新）----
+out '[2/4] 选择国内 APT 镜像源（同时配置 Armbian / Debian 主源与安全更新）'
+out '  1) 清华大学 TUNA   （教育网/公网，推荐）'
+out '  2) 中国科大 USTC   （教育网/公网）'
+out '  3) 上海交通大学 SJTU（教育网/公网）'
+out '  4) 阿里云 Aliyun    （公网）'
+out '  5) 华为云 Huawei    （公网）'
+out '  6) 保留当前官方源'
+mirror_choice="$(ask '请选择 [1-6]，直接回车默认为 1: ')"
+[[ -z "$mirror_choice" ]] && mirror_choice=1
+
+mirror_name="清华大学 TUNA"
+arm_uri="https://mirrors.tuna.tsinghua.edu.cn/armbian"
+deb_uri="https://mirrors.tuna.tsinghua.edu.cn/debian"
+sec_uri="https://mirrors.tuna.tsinghua.edu.cn/debian-security"
+case "$mirror_choice" in
+    1) ;;
+    2)
+        mirror_name="中国科大 USTC"
+        arm_uri="https://mirrors.ustc.edu.cn/armbian"
+        deb_uri="https://mirrors.ustc.edu.cn/debian"
+        sec_uri="https://mirrors.ustc.edu.cn/debian-security"
+        ;;
+    3)
+        mirror_name="上海交通大学 SJTU"
+        arm_uri="https://mirror.sjtu.edu.cn/armbian"
+        deb_uri="https://mirror.sjtu.edu.cn/debian"
+        sec_uri="https://mirror.sjtu.edu.cn/debian-security"
+        ;;
+    4)
+        mirror_name="阿里云 Aliyun"
+        arm_uri="https://mirrors.aliyun.com/armbian"
+        deb_uri="https://mirrors.aliyun.com/debian"
+        sec_uri="https://mirrors.aliyun.com/debian-security"
+        ;;
+    5)
+        mirror_name="华为云 Huawei"
+        arm_uri="https://repo.huaweicloud.com/armbian"
+        deb_uri="https://repo.huaweicloud.com/debian"
+        sec_uri="https://repo.huaweicloud.com/debian-security"
+        ;;
+    6)
+        mirror_name="keep-official"
+        arm_uri="http://apt.armbian.com"
+        deb_uri="http://deb.debian.org/debian"
+        sec_uri="http://security.debian.org/"
+        ;;
+    *)
+        out "无效选择，使用默认：${mirror_name}。"
+        ;;
+esac
+
+if [[ "$mirror_name" != "keep-official" ]]; then
+    cat > /etc/apt/sources.list.d/armbian.sources <<EOF
+Types: deb
+URIs: ${arm_uri}
+Suites: trixie
+Components: main trixie-utils trixie-desktop
+Signed-By: /usr/share/keyrings/armbian-archive-keyring.gpg
+EOF
+    cat > /etc/apt/sources.list.d/debian.sources <<EOF
+Types: deb
+URIs: ${deb_uri}
+Suites: trixie trixie-updates trixie-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: ${sec_uri}
+Suites: trixie-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+    out "已写入 APT 源：${mirror_name}"
+    out "  Armbian : ${arm_uri}"
+    out "  Debian  : ${deb_uri}"
+    out "  Security: ${sec_uri}"
+    if command -v apt-get >/dev/null 2>&1; then
+        out '尝试更新软件包索引（最多 180 秒，失败不影响本次初始化）...'
+        if timeout 180 apt-get update -qq >/dev/null 2>&1; then
+            out 'APT 索引更新完成。'
+        else
+            out 'APT 索引更新未完成（可能网络未就绪），稍后可手动执行 apt update。'
+        fi
+    fi
+else
+    out '保留当前 APT 源不变。'
+fi
+{
+    printf 'mirror=%s\n' "$mirror_name"
+    printf 'arm=%s\n' "$arm_uri"
+    printf 'debian=%s\n' "$deb_uri"
+    printf 'security=%s\n' "$sec_uri"
+    printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$MIRROR_RECORD"
+
+# ---- 3. 锁定定制内核 ----
+out '[3/4] 锁定定制内核，防止 apt 升级覆盖 /boot 与模块'
+held_pkgs=()
+for pkg in linux-image-current-rockchip64 linux-dtb-current-rockchip64 linux-headers-current-rockchip64; do
+    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
+        held_pkgs+=("$pkg")
+    fi
+done
+if [[ ${#held_pkgs[@]} -gt 0 ]]; then
+    apt-mark hold "${held_pkgs[@]}" >/dev/null 2>&1 || true
+    out "已 apt-mark hold: ${held_pkgs[*]}"
+else
+    out '未发现已安装的 Armbian 内核包；本镜像使用手工安装的 vendor 6.1 内核，无需 hold。'
+fi
+{
+    printf '# TN3399_V3 使用定制 vendor 6.1 内核，禁止 apt 升级覆盖。\n'
+    printf 'kernel=%s\n' "$(uname -r)"
+    printf 'held=%s\n' "${held_pkgs[*]:-none}"
+    printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$KERNEL_LOCK"
+
+# ---- 4. 重命名主机 ----
+out '[4/4] 重命名主机'
+old_host="$(hostname)"
+while true; do
+    new_host="$(ask "请输入新主机名（当前：${old_host}；直接回车保持不变）: ")"
+    [[ -z "$new_host" ]] && new_host="$old_host"
+    if [[ "$new_host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+        break
+    fi
+    out '主机名不合法：仅允许字母、数字、连字符，首尾不能为连字符，长度 1-63。'
+done
+if ! hostnamectl set-hostname "$new_host" >/dev/null 2>&1; then
+    printf '%s\n' "$new_host" > /etc/hostname
+    hostname "$new_host" >/dev/null 2>&1 || true
+fi
+sed -i -E "s|^127\.0\.1\.1[[:space:]].*|127.0.1.1\t${new_host}|" /etc/hosts
+grep -qE "^127\.0\.1\.1[[:space:]]+${new_host}([[:space:]]|$)" /etc/hosts \
+    || printf '127.0.1.1\t%s\n' "$new_host" >> /etc/hosts
+out "主机名已设置为 ${new_host}。"
+
+# ---- 完成 ----
+mkdir -p "$(dirname "$STATE")"
+{
+    printf 'done\n'
+    printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'user=%s\n' "$username"
+    printf 'hostname=%s\n' "$new_host"
+    printf 'mirror=%s\n' "$mirror_name"
+    printf 'held_kernel=%s\n' "${held_pkgs[*]:-none}"
+} > "$STATE"
+out "初始化完成，状态已写入 ${STATE}。"
+out '本服务将自动禁用；请使用新用户或 root 从串口登录。'
+systemctl disable tn3399-firstboot-setup.service >/dev/null 2>&1 || true

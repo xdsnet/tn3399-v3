@@ -1,0 +1,13 @@
+[Unit]
+Description=TN3399_V3 first boot interactive setup
+After=network.target getty.target armbian-firstrun.service
+ConditionPathExists=/usr/local/sbin/tn3399-firstboot-setup
+ConditionPathExists=!/var/lib/tn3399-firstboot-setup.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tn3399-firstboot-setup
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

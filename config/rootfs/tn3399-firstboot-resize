@@ -1,0 +1,53 @@
+#!/bin/bash
+# TN3399_V3 首次启动根分区扩容。
+# 直接复用 Armbian 自带的 armbian-resize-filesystem（分区 + ext4 文件系统），
+# 避免重复实现 fdisk/resize2fs 造成分区表竞态；本服务只负责一次性触发、记录状态与禁用自身。
+set -euo pipefail
+
+LOG=/var/log/tn3399-firstboot-resize.log
+STATE=/var/lib/tn3399-firstboot-resize.done
+REBOOT_MARK=/var/run/resize2fs-reboot
+ARMBIAN_RESIZE=/usr/lib/armbian/armbian-resize-filesystem
+
+exec >>"$LOG" 2>&1
+printf '\n===== firstboot resize %s =====\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [[ -f "$STATE" ]]; then
+    printf '已完成扩容（标记 %s 存在），跳过。\n' "$STATE"
+    exit 0
+fi
+
+if [[ -f /root/.no_rootfs_resize ]]; then
+    printf '检测到 /root/.no_rootfs_resize，按用户配置跳过扩容。\n'
+    mkdir -p "$(dirname "$STATE")"
+    printf 'disabled-by-user\n' > "$STATE"
+    systemctl disable tn3399-firstboot-resize.service >/dev/null 2>&1 || true
+    exit 0
+fi
+
+if [[ ! -x "$ARMBIAN_RESIZE" ]]; then
+    printf '未找到可执行的 %s，跳过扩容（请检查基础镜像完整性）。\n' "$ARMBIAN_RESIZE" >&2
+    exit 0
+fi
+
+printf '根设备: %s\n' "$(findmnt -n -o SOURCE / 2>/dev/null || echo unknown)"
+printf '扩容前: %s\n' "$(findmnt -n -b -o SIZE / 2>/dev/null || echo unknown)"
+printf '调用 Armbian 扩容脚本: %s start\n' "$ARMBIAN_RESIZE"
+"$ARMBIAN_RESIZE" start
+
+# Armbian 脚本在分区表未能在线刷新时写入此标记，下次启动需再跑一次。
+if [[ -f "$REBOOT_MARK" ]]; then
+    printf '检测到 %s，扩容需重启后继续；保留本服务待下次启动重试。\n' "$REBOOT_MARK"
+    exit 0
+fi
+
+mkdir -p "$(dirname "$STATE")"
+{
+    printf 'done\n'
+    printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'root=%s\n' "$(findmnt -n -o SOURCE / 2>/dev/null || echo unknown)"
+    printf 'size=%s\n' "$(findmnt -n -b -o SIZE / 2>/dev/null || echo unknown)"
+} > "$STATE"
+printf '扩容后: %s\n' "$(findmnt -n -b -o SIZE / 2>/dev/null || echo unknown)"
+printf '首次启动扩容完成，写入 %s 并禁用本服务。\n' "$STATE"
+systemctl disable tn3399-firstboot-resize.service >/dev/null 2>&1 || true

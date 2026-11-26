@@ -1,0 +1,16 @@
+[Unit]
+Description=TN3399_V3 first boot rootfs resize
+After=sysinit.target local-fs.target
+Before=basic.target
+DefaultDependencies=no
+ConditionPathExists=/usr/local/sbin/tn3399-firstboot-resize
+ConditionPathExists=!/root/.no_rootfs_resize
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tn3399-firstboot-resize
+TimeoutStartSec=6min
+
+[Install]
+WantedBy=basic.target
