@@ -6,6 +6,7 @@
 # `make fetch` / `make all` 重新生成，详见 docs/02-构建与刷机.md。
 # ============================================================
 .env
+.git-credentials
 # --- 下载的第三方源码与基础镜像（make fetch 生成） ---
 /sources/
 
